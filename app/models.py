@@ -171,3 +171,47 @@ class ValidateResponse(BaseModel):
     first_difference_batch_id: int | None = None
     difference: DifferenceDetail | None = None
     notes: list[str] = Field(default_factory=list)
+
+
+class AnonymizeRequest(BaseModel):
+    """编号脱敏请求：与精简/校验接口相同的输入格式。"""
+
+    initial: InitialData
+    batches: list[Batch] = Field(..., min_length=1, max_length=20)
+    sql: SqlBundle
+
+    @model_validator(mode="after")
+    def _unique_batches(self) -> "AnonymizeRequest":
+        ids = [b.batch_id for b in self.batches]
+        if len(ids) != len(set(ids)):
+            raise ValueError("batch_id 必须唯一")
+        return self
+
+
+class AnonymizeResponse(BaseModel):
+    status: Literal["shareable", "not_shareable"] = Field(
+        ...,
+        description=(
+            "shareable=脱敏样本已用原 SQL 双重重放验证保真，可交付外部；"
+            "not_shareable=原样本无差异、执行无法判定或脱敏不保真，"
+            "此时不交付任何样本内容"
+        ),
+    )
+    anonymized_input: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "脱敏后的 initial 与 batches（编号已替换为与原号不重叠的正整数，"
+            "金额、批号、变更顺序不变）。**不含 SQL**：SQL 由外部维护者自有。"
+            "无法安全分享时为 null"
+        ),
+    )
+    first_difference_batch_id: int | None = Field(
+        None, description="脱敏样本首次差异的批号（与原样本相同）；不可分享时为 null"
+    )
+    difference: DifferenceDetail | None = Field(
+        None, description="脱敏样本首次差异的缺行/多行（使用新编号）；不可分享时为 null"
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="判定依据说明（不含原始编号、原 SQL 与映射）",
+    )

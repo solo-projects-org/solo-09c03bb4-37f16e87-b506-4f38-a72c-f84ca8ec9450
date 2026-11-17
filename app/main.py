@@ -9,13 +9,17 @@ run concurrently without sharing a connection).
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
 from . import __version__, config
+from .anonymize import STATUS_SHAREABLE, attempt_share
 from .executor import Executor
 from .models import (
+    AnonymizeRequest,
+    AnonymizeResponse,
     Batch,
     DifferenceDetail,
     MinimizeRequest,
@@ -65,7 +69,9 @@ def health() -> dict[str, Any]:
     }
 
 
-def _prepare(request: MinimizeRequest | ValidateRequest) -> Executor:
+def _prepare(
+    request: MinimizeRequest | ValidateRequest | AnonymizeRequest,
+) -> Executor:
     try:
         validate_all(request.initial, request.batches)
     except InputError as exc:
@@ -143,4 +149,54 @@ def validate(request: ValidateRequest) -> ValidateResponse:
         first_difference_batch_id=batch_id,
         difference=difference,
         notes=result.notes,
+    )
+
+
+@app.post(
+    "/v1/anonymize",
+    response_model=AnonymizeResponse,
+    summary="编号脱敏并验证保真，产出可对外分享的错算反例",
+    tags=["脱敏"],
+    responses={
+        422: {"description": "输入非法或 SQL 违反安全策略"},
+    },
+)
+def anonymize(request: AnonymizeRequest) -> AnonymizeResponse:
+    """把真实反例中的业务编号脱敏后交给外部 SQL 维护者。
+
+    流程：先用原 SQL 重放原样本确认存在差异；再把初态与全部批次前后像中
+    的订单号、退款号、退款归属号一致替换为与原号不重叠的正整数（金额、
+    批号、变更顺序不变）；脱敏样本用原 SQL 再重放一次，只有首次差异批号
+    相同、缺失/多余行按编号对应后与原见证一致，才返回脱敏初态、批次与
+    新见证。响应不含原 SQL、原号映射与原始编号。无法确认保真时只报告
+    `not_shareable`，不交付部分样本。
+    """
+    executor = _prepare(request)
+    attempt = attempt_share(
+        request.initial,
+        request.batches,
+        executor,
+        deadline=time.monotonic() + config.MAX_REQUEST_SECONDS,
+    )
+
+    anonymized_input = None
+    difference = None
+    batch_id = None
+    if attempt.status == STATUS_SHAREABLE:
+        assert attempt.initial is not None and attempt.batches is not None
+        anonymized_input = {
+            "initial": attempt.initial.model_dump(mode="json"),
+            "batches": _dump_batches(attempt.batches),
+        }
+        batch_id = attempt.first_difference_batch_id
+        assert attempt.difference is not None
+        missing, extra = attempt.difference
+        difference = DifferenceDetail(missing=missing, extra=extra)
+
+    return AnonymizeResponse(
+        status=attempt.status,  # type: ignore[arg-type]
+        anonymized_input=anonymized_input,
+        first_difference_batch_id=batch_id,
+        difference=difference,
+        notes=attempt.notes,
     )

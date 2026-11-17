@@ -47,6 +47,41 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 删掉后批次 103 的删除目标不存在，输入非法。`examples/correct_incremental.json` 是正确
 实现，返回 `no_difference`。
 
+## 编号脱敏（对外分享反例）
+
+`POST /v1/anonymize` 接收与精简接口**相同格式**的初态、顺序批次和全量/增量 SQL，
+用于把真实的错算反例安全地交给外部 SQL 维护者：
+
+1. **先确认原样本有差异**：用原 SQL 重放原始输入，确认错算反例成立；
+   无差异或执行无法判定（报错/超时/超限）时拒绝交付。
+2. **编号替换**：把初态与全部批次前后像中的订单号、退款号、退款归属号
+   （`refunds.order_id` 与 `orders.order_id` 同号同源，按数值一致映射）统一替换成
+   **与原号不重叠的正整数**；金额、批号、变更顺序保持不变。映射是单射，
+   相等性结构（含跨表比较）完整保留。
+3. **保真验证**：脱敏样本用**原 SQL** 再重放一次。只有首次差异批号与原样本相同，
+   且缺失/多余行按编号对应后与原见证一致（多重集），才返回结果。
+
+返回（`status: "shareable"` 时）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `anonymized_input` | 脱敏后的 `initial` 与 `batches`（**不含 SQL**，SQL 由外部维护者自有） |
+| `first_difference_batch_id` | 脱敏样本首次差异的批号（与原样本相同） |
+| `difference` | 脱敏样本的缺失/多余行（使用新编号） |
+
+响应**不含**原 SQL、原号映射与任何原始编号。无法确认保真时只返回
+`status: "not_shareable"` 与原因说明，`anonymized_input`/`difference` 均为 null，
+**不交付部分样本**。外部维护者拿到脱敏样本后，可拼上自己维护的 SQL 调
+`/v1/validate` 复现完全相同的差异批号与见证。
+
+```bash
+curl -s -X POST http://localhost:8000/v1/anonymize \
+     -H 'content-type: application/json' \
+     --data-binary @examples/leak_refund_delete.json | python3 -m json.tool
+# → status "shareable"，初态订单号变为 1/2，首次差异批号仍为 103，
+#   difference {"missing": [[1, 3800]], "extra": [[1, 3300]]}
+```
+
 ## 数据模型与执行契约
 
 ### 初始数据
@@ -180,14 +215,15 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 
 ```
 app/
-  main.py       FastAPI 应用与端点
+  main.py       FastAPI 应用与端点（/v1/minimize、/v1/validate、/v1/anonymize）
   models.py     Pydantic 请求/响应模型
   validate.py   初始数据与批次合法性、CDC 记录
   schema.py     SQLite 表结构与序列化
   sqlguard.py   SQL 策略（文本预检 + authorizer）
   executor.py   单次试验：重建库、逐批事务、多重集比较
   reducer.py    ddmin 缩减与最小性认证
+  anonymize.py  编号脱敏与保真验证（双重重放核对见证）
   config.py     环境变量配置
-tests/          92 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、API、契约）
+tests/          109 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、脱敏、API、契约）
 examples/       正确实现与漏删退款的反例
 ```
